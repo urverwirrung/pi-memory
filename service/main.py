@@ -34,8 +34,8 @@ qdrant = None
 
 COLLECTION = "memories"
 MODEL_DIM = 3584          # GTE-Qwen2-7B base dimensions
-EIGENVECTOR_DIM = 4       # certainty, clarity, scope, stakes
-TOTAL_DIM = MODEL_DIM + EIGENVECTOR_DIM  # 3588
+STATE_DIM = 6             # certainty, clarity, scope, stakes, valence, arousal
+TOTAL_DIM = MODEL_DIM + STATE_DIM  # 3590
 
 
 # --- Helpers ---
@@ -59,7 +59,20 @@ def compute_strength(initial_strength: float, access_count: int,
 # --- Request/Response Models ---
 
 class EmbedRequest(BaseModel):
-    """Structured input for embedding."""
+    """Structured input for embedding.
+
+    The six state dimensions:
+    - certainty: how well do I understand what's going on?
+    - clarity: how clear is what we're optimizing for?
+    - scope: how broad vs deep should attention be?
+    - stakes: what are the consequences of getting this wrong?
+    - valence: how well are things going? (positive = aligned, negative = misaligned)
+    - arousal: how significant is this moment? (high = activated, low = routine)
+
+    The first four (eigenvectors) describe cognitive posture toward the task.
+    The last two describe cognitive posture toward my own performance —
+    the elephant's signal to the monkey. Self-assessed, not computed.
+    """
     content: str
     context: str = ""
     active: str = ""
@@ -68,6 +81,8 @@ class EmbedRequest(BaseModel):
     clarity: float = Field(0.5, ge=0.0, le=1.0)
     scope: float = Field(0.5, ge=0.0, le=1.0)
     stakes: float = Field(0.5, ge=0.0, le=1.0)
+    valence: float = Field(0.5, ge=0.0, le=1.0)
+    arousal: float = Field(0.5, ge=0.0, le=1.0)
 
 
 class EmbedResponse(BaseModel):
@@ -221,11 +236,13 @@ def format_structured_input(req: EmbedRequest) -> str:
     parts.append(f"[CLARITY: {req.clarity:.2f}]")
     parts.append(f"[SCOPE: {req.scope:.2f}]")
     parts.append(f"[STAKES: {req.stakes:.2f}]")
+    parts.append(f"[VALENCE: {req.valence:.2f}]")
+    parts.append(f"[AROUSAL: {req.arousal:.2f}]")
     return "\n".join(parts)
 
 
-def compute_embedding(text: str, eigenvectors: list[float]) -> list[float]:
-    """Compute embedding: model output (3584d) + eigenvectors (4d) = 3588d."""
+def compute_embedding(text: str, state_dims: list[float]) -> list[float]:
+    """Compute embedding: model output (3584d) + state dimensions (6d) = 3590d."""
     inputs = tokenizer(
         text,
         return_tensors="pt",
@@ -251,16 +268,17 @@ def compute_embedding(text: str, eigenvectors: list[float]) -> list[float]:
     # Normalize
     mean_pooled = torch.nn.functional.normalize(mean_pooled, p=2, dim=0)
 
-    # Convert to list and append eigenvectors
+    # Convert to list and append state dimensions
     base_vec = mean_pooled.cpu().float().numpy().tolist()
-    return base_vec + eigenvectors
+    return base_vec + state_dims
 
 
 def embed_request(req: EmbedRequest) -> list[float]:
     """Full pipeline: format structured input → compute embedding."""
     text = format_structured_input(req)
-    eigenvectors = [req.certainty, req.clarity, req.scope, req.stakes]
-    return compute_embedding(text, eigenvectors)
+    state_dims = [req.certainty, req.clarity, req.scope, req.stakes,
+                  req.valence, req.arousal]
+    return compute_embedding(text, state_dims)
 
 
 # --- App ---
