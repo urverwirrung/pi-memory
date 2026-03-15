@@ -335,6 +335,11 @@ async def store(req: StoreRequest):
     vector = embed_request(req.embed)
     point_id = make_point_id(req.memory_id, req.ctx_index)
 
+    # Store the base embedding in payload (immutable historical record)
+    # The Qdrant vector = base + offset (effective embedding for search)
+    # Initially offset is zero, so vector = base
+    offset = [0.0] * TOTAL_DIM
+
     qdrant.upsert(
         collection_name=COLLECTION,
         points=[
@@ -352,7 +357,8 @@ async def store(req: StoreRequest):
                     "last_accessed": req.last_accessed,
                     "access_count": req.access_count,
                     "co_occurrence": req.co_occurrence,
-                    "offset": [0.0] * TOTAL_DIM,
+                    "base_embedding": vector,
+                    "offset": offset,
                 },
             )
         ],
@@ -427,9 +433,15 @@ async def update_dynamics(req: UpdateDynamicsRequest):
     """
     Post-retrieval updates: reconsolidation + Hebbian learning.
 
-    For Hebbian learning, we update the actual stored vectors in Qdrant
-    (base + cumulative offset) rather than maintaining a separate offset
-    field. This means search always uses effective embeddings automatically.
+    Hebbian learning updates the OFFSET, not the base embedding.
+    The base embedding is the immutable historical record (including
+    original valence/arousal at encoding time). The offset accumulates
+    drift from co-occurrence. The Qdrant vector = base + offset, so
+    search always uses effective embeddings.
+
+    The delta between base and effective embedding on the valence/arousal
+    dimensions IS the therapeutic change — how my relationship to a
+    memory has evolved through re-experiencing it in new contexts.
     """
     start = time.time()
     updated = 0
@@ -468,21 +480,25 @@ async def update_dynamics(req: UpdateDynamicsRequest):
         )
         updated += 1
 
-    # 2. Hebbian learning — co-retrieved pairs drift closer
+    # 2. Hebbian learning — co-retrieved pairs drift closer via offsets
     if len(points) > 1:
         pid_list = [p.id for p in points]
-        vectors = {p.id: np.array(p.vector) for p in points}
 
-        updates = []  # (point_id, new_vector, co_occurrence_update)
+        # Get effective embeddings (current vectors) and offsets
+        effective = {p.id: np.array(p.vector) for p in points}
+        offsets = {
+            p.id: np.array(p.payload.get("offset", [0.0] * TOTAL_DIM))
+            for p in points
+        }
 
         for i, p1_id in enumerate(pid_list):
             for p2_id in pid_list[i + 1:]:
-                v1 = vectors[p1_id]
-                v2 = vectors[p2_id]
+                eff1 = effective[p1_id]
+                eff2 = effective[p2_id]
 
-                # Drift toward each other
-                vectors[p1_id] = v1 + req.lr * (v2 - v1)
-                vectors[p2_id] = v2 + req.lr * (v1 - v2)
+                # Update offsets — drift toward each other
+                offsets[p1_id] = offsets[p1_id] + req.lr * (eff2 - eff1)
+                offsets[p2_id] = offsets[p2_id] + req.lr * (eff1 - eff2)
 
                 # Update co-occurrence counts
                 mem1_id = points_by_id[p1_id].payload["memory_id"]
@@ -493,14 +509,20 @@ async def update_dynamics(req: UpdateDynamicsRequest):
                 co1[mem2_id] = co1.get(mem2_id, 0) + 1
                 co2[mem1_id] = co2.get(mem1_id, 0) + 1
 
-        # Write updated vectors and co-occurrence back to Qdrant
+        # Recompute effective vectors (base + updated offset) and write back
         upsert_points = []
         for pid in pid_list:
             p = points_by_id[pid]
+            base = np.array(p.payload.get("base_embedding", p.vector))
+            new_effective = base + offsets[pid]
+
+            payload = p.payload.copy()
+            payload["offset"] = offsets[pid].tolist()
+
             upsert_points.append(PointStruct(
                 id=pid,
-                vector=vectors[pid].tolist(),
-                payload=p.payload,  # includes updated co_occurrence
+                vector=new_effective.tolist(),
+                payload=payload,
             ))
 
         if upsert_points:
