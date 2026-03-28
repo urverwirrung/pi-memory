@@ -381,16 +381,17 @@ async def search(req: SearchRequest):
 
     query_vector = embed_request(req.query)
 
-    results = qdrant.search(
+    response = qdrant.query_points(
         collection_name=COLLECTION,
-        query_vector=query_vector,
+        query=query_vector,
         limit=req.top_k * 3 if req.exclude_memory_ids else req.top_k,
+        with_payload=True,
     )
 
     search_results = []
     seen_memory_ids = set()
 
-    for hit in results:
+    for hit in response.points:
         payload = hit.payload
         mem_id = payload["memory_id"]
 
