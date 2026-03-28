@@ -32,3 +32,26 @@ services:
     depends_on:
       - qdrant
     restart: unless-stopped
+
+  extraction:
+    build:
+      context: .
+      dockerfile: Dockerfile.extraction
+    ports:
+      - "8200:8200"
+    volumes:
+      - ./data/models:/models
+    environment:
+      - MODEL_NAME=Qwen/Qwen2.5-7B-Instruct
+      - DEVICE=cuda:0
+      - QUANTIZE=int8
+      - HOST=0.0.0.0
+      - PORT=8200
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['1']  # 5080
+              capabilities: [gpu]
+    restart: unless-stopped
