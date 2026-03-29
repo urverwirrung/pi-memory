@@ -438,7 +438,7 @@ async def search(req: SearchRequest):
     response = qdrant.query_points(
         collection_name=COLLECTION,
         query=query_vector,
-        limit=req.top_k * 3 if req.exclude_memory_ids else req.top_k,
+        limit=req.top_k + len(req.exclude_memory_ids) + 10,
         with_payload=True,
     )
     search_elapsed_ms = (time.time() - t_search) * 1000
