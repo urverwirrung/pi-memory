@@ -118,6 +118,7 @@ class StoreRequest(BaseModel):
     created_at: float = Field(default_factory=time.time)
     last_accessed: float = Field(default_factory=time.time)
     access_count: int = 0
+    created_at: float
     co_occurrence: dict[str, int] = Field(default_factory=dict)
 
 
@@ -144,6 +145,7 @@ class SearchResult(BaseModel):
     decay_rate: float
     last_accessed: float
     access_count: int
+    created_at: float
     co_occurrence: dict[str, int]
 
 
@@ -230,8 +232,13 @@ def init_qdrant():
 
 # --- Embedding Logic ---
 
-def format_structured_input(req: EmbedRequest) -> str:
-    parts = [f"[CONTENT: {req.content}]"]
+def format_structured_input(req: EmbedRequest, is_query: bool = False) -> str:
+    if is_query:
+        # GTE-Qwen2 requires Instruct prefix for queries
+        parts = [f"Instruct: Retrieve relevant memories for the current context."]
+        parts.append(f"Query: {req.content}")
+    else:
+        parts = [f"{req.content}"]
     if req.context:
         parts.append(f"[CONTEXT: {req.context}]")
     if req.active:
@@ -262,24 +269,29 @@ def compute_embedding(text: str, state_dims: list[float]) -> list[float]:
     with torch.no_grad():
         outputs = model(**inputs)
 
-    # Last hidden state, mean pooling over non-padding tokens
+    # Last token pooling (required by GTE-Qwen2)
     attention_mask = inputs["attention_mask"]
     hidden = outputs.last_hidden_state
-    mask_expanded = attention_mask.unsqueeze(-1).expand(hidden.size()).float()
-    sum_embeddings = torch.sum(hidden * mask_expanded, dim=1)
-    sum_mask = torch.clamp(mask_expanded.sum(dim=1), min=1e-9)
-    mean_pooled = (sum_embeddings / sum_mask).squeeze(0)
+    # Find the last non-padding token for each sequence
+    sequence_lengths = attention_mask.sum(dim=1) - 1
+    batch_size = hidden.shape[0]
+    pooled = hidden[torch.arange(batch_size, device=hidden.device), sequence_lengths]
 
     # Normalize
-    mean_pooled = torch.nn.functional.normalize(mean_pooled, p=2, dim=0)
+    pooled = torch.nn.functional.normalize(pooled, p=2, dim=-1).squeeze(0)
 
     # Convert to list and append state dimensions
-    base_vec = mean_pooled.cpu().float().numpy().tolist()
-    return base_vec + state_dims
+    # State dims are centered at 0 and scaled to ~10% of content magnitude.
+    # When all states are 0.5 (default), they become 0.0 — no effect on similarity.
+    # When they differ, they contribute a meaningful but not dominant signal.
+    STATE_SCALE = 0.1
+    base_vec = pooled.cpu().float().numpy().tolist()
+    scaled_state = [(v - 0.5) * STATE_SCALE for v in state_dims]
+    return base_vec + scaled_state
 
 
-def embed_request(req: EmbedRequest) -> list[float]:
-    text = format_structured_input(req)
+def embed_request(req: EmbedRequest, is_query: bool = False) -> list[float]:
+    text = format_structured_input(req, is_query=is_query)
     state_dims = [req.certainty, req.clarity, req.scope, req.stakes,
                   req.valence, req.arousal]
     return compute_embedding(text, state_dims)
@@ -327,10 +339,26 @@ async def get_activity(limit: int = 20):
     return {"operations": list(activity_log)[:limit]}
 
 
+class EmbedEndpointRequest(BaseModel):
+    """Wraps EmbedRequest with optional is_query flag."""
+    content: str
+    context: str = ""
+    active: str = ""
+    purposes: str = ""
+    certainty: float = Field(0.5, ge=0.0, le=1.0)
+    clarity: float = Field(0.5, ge=0.0, le=1.0)
+    scope: float = Field(0.5, ge=0.0, le=1.0)
+    stakes: float = Field(0.5, ge=0.0, le=1.0)
+    valence: float = Field(0.5, ge=0.0, le=1.0)
+    arousal: float = Field(0.5, ge=0.0, le=1.0)
+    is_query: bool = False
+
+
 @app.post("/embed", response_model=EmbedResponse)
-async def embed(req: EmbedRequest):
+async def embed(req: EmbedEndpointRequest):
     start = time.time()
-    vector = embed_request(req)
+    embed_req = EmbedRequest(**{k: v for k, v in req.model_dump().items() if k != "is_query"})
+    vector = embed_request(embed_req, is_query=req.is_query)
     elapsed_ms = (time.time() - start) * 1000
 
     log_activity("embed", {
@@ -402,7 +430,7 @@ async def search(req: SearchRequest):
 
     # Step 1: Embed query
     t_embed = time.time()
-    query_vector = embed_request(req.query)
+    query_vector = embed_request(req.query, is_query=True)
     query_elapsed_ms = (time.time() - t_embed) * 1000
 
     # Step 2: Search Qdrant
@@ -450,6 +478,7 @@ async def search(req: SearchRequest):
             decay_rate=payload.get("decay_rate", 0.05),
             last_accessed=payload.get("last_accessed", 0),
             access_count=payload.get("access_count", 0),
+            created_at=payload.get("created_at", 0),
             co_occurrence=payload.get("co_occurrence", {}),
         ))
 
