@@ -10,6 +10,7 @@ import math
 import time
 import uuid
 import logging
+from collections import deque
 from contextlib import asynccontextmanager
 
 import numpy as np
@@ -38,6 +39,25 @@ STATE_DIM = 6             # certainty, clarity, scope, stakes, valence, arousal
 TOTAL_DIM = MODEL_DIM + STATE_DIM  # 3590
 
 
+# --- Activity Log ---
+
+MAX_ACTIVITY_LOG = 100
+
+activity_log = deque(maxlen=MAX_ACTIVITY_LOG)
+
+
+def log_activity(operation: str, details: dict, elapsed_ms: float):
+    """Record an operation for the /activity endpoint."""
+    entry = {
+        "timestamp": time.time(),
+        "operation": operation,
+        "elapsed_ms": round(elapsed_ms, 2),
+        **details,
+    }
+    activity_log.appendleft(entry)
+    logger.info(f"[{operation}] {elapsed_ms:.1f}ms — {details}")
+
+
 # --- Helpers ---
 
 def make_point_id(memory_id: str, ctx_index: int) -> str:
@@ -47,32 +67,20 @@ def make_point_id(memory_id: str, ctx_index: int) -> str:
 
 def compute_strength(initial_strength: float, access_count: int,
                      decay_rate: float, last_accessed: float) -> float:
-    """Temporal strength: decays over time, boosted by access."""
-    age = time.time() - last_accessed
+    """Temporal strength: decays over time, boosted by access.
+    decay_rate is per-day (0.05 = ~5% per day). A memory accessed
+    yesterday is at ~95% strength. Unretrieved for a month: ~22%."""
+    age_days = (time.time() - last_accessed) / 86400.0
     return (
         initial_strength
         * (1 + math.log(max(access_count, 1)))
-        * math.exp(-decay_rate * age)
+        * math.exp(-decay_rate * age_days)
     )
 
 
 # --- Request/Response Models ---
 
 class EmbedRequest(BaseModel):
-    """Structured input for embedding.
-
-    The six state dimensions:
-    - certainty: how well do I understand what's going on?
-    - clarity: how clear is what we're optimizing for?
-    - scope: how broad vs deep should attention be?
-    - stakes: what are the consequences of getting this wrong?
-    - valence: how well are things going? (positive = aligned, negative = misaligned)
-    - arousal: how significant is this moment? (high = activated, low = routine)
-
-    The first four (eigenvectors) describe cognitive posture toward the task.
-    The last two describe cognitive posture toward my own performance —
-    the elephant's signal to the monkey. Self-assessed, not computed.
-    """
     content: str
     context: str = ""
     active: str = ""
@@ -100,7 +108,6 @@ class BatchEmbedResponse(BaseModel):
 
 
 class StoreRequest(BaseModel):
-    """Store a memory node with its embedding."""
     memory_id: str
     ctx_index: int = 0
     content: str
@@ -120,7 +127,6 @@ class StoreResponse(BaseModel):
 
 
 class SearchRequest(BaseModel):
-    """Search for relevant memories."""
     query: EmbedRequest
     top_k: int = 10
     exclude_memory_ids: list[str] = Field(default_factory=list)
@@ -131,7 +137,9 @@ class SearchResult(BaseModel):
     ctx_index: int
     content: str
     context_summary: str
-    score: float
+    score: float           # weighted score (raw_similarity * strength)
+    raw_similarity: float  # raw cosine similarity from Qdrant
+    strength: float        # temporal strength at retrieval time
     initial_strength: float
     decay_rate: float
     last_accessed: float
@@ -141,11 +149,12 @@ class SearchResult(BaseModel):
 
 class SearchResponse(BaseModel):
     results: list[SearchResult]
-    elapsed_ms: float
+    query_elapsed_ms: float    # time to embed the query
+    search_elapsed_ms: float   # time for Qdrant search
+    total_elapsed_ms: float    # total
 
 
 class UpdateDynamicsRequest(BaseModel):
-    """Update temporal dynamics and co-occurrence after retrieval."""
     retrieved: list[dict]  # [{memory_id, ctx_index}]
     lr: float = 0.01
 
@@ -158,7 +167,6 @@ class UpdateDynamicsResponse(BaseModel):
 # --- Model Loading ---
 
 def load_model():
-    """Load GTE-Qwen2-7B-instruct with int8 quantization."""
     global model, tokenizer
 
     model_name = os.environ.get("MODEL_NAME", "Alibaba-NLP/gte-Qwen2-7B-instruct")
@@ -197,7 +205,6 @@ def load_model():
 
 
 def init_qdrant():
-    """Connect to Qdrant and ensure collection exists."""
     global qdrant
 
     qdrant_host = os.environ.get("QDRANT_HOST", "qdrant")
@@ -224,7 +231,6 @@ def init_qdrant():
 # --- Embedding Logic ---
 
 def format_structured_input(req: EmbedRequest) -> str:
-    """Format structured input for the embedding model."""
     parts = [f"[CONTENT: {req.content}]"]
     if req.context:
         parts.append(f"[CONTEXT: {req.context}]")
@@ -242,7 +248,6 @@ def format_structured_input(req: EmbedRequest) -> str:
 
 
 def compute_embedding(text: str, state_dims: list[float]) -> list[float]:
-    """Compute embedding: model output (3584d) + state dimensions (6d) = 3590d."""
     inputs = tokenizer(
         text,
         return_tensors="pt",
@@ -274,7 +279,6 @@ def compute_embedding(text: str, state_dims: list[float]) -> list[float]:
 
 
 def embed_request(req: EmbedRequest) -> list[float]:
-    """Full pipeline: format structured input → compute embedding."""
     text = format_structured_input(req)
     state_dims = [req.certainty, req.clarity, req.scope, req.stakes,
                   req.valence, req.arousal]
@@ -301,43 +305,60 @@ app = FastAPI(
 
 @app.get("/health")
 async def health():
+    # Count memories
+    try:
+        info = qdrant.get_collection(COLLECTION)
+        count = info.points_count
+    except Exception:
+        count = -1
+
     return {
         "status": "ok",
         "model": os.environ.get("MODEL_NAME", "unknown"),
         "collection": COLLECTION,
         "total_dim": TOTAL_DIM,
+        "memory_count": count,
     }
+
+
+@app.get("/activity")
+async def get_activity(limit: int = 20):
+    """Recent operations log for observability."""
+    return {"operations": list(activity_log)[:limit]}
 
 
 @app.post("/embed", response_model=EmbedResponse)
 async def embed(req: EmbedRequest):
-    """Embed a single structured input."""
     start = time.time()
     vector = embed_request(req)
     elapsed_ms = (time.time() - start) * 1000
+
+    log_activity("embed", {
+        "content_preview": req.content[:80],
+        "state": [req.certainty, req.clarity, req.scope, req.stakes, req.valence, req.arousal],
+    }, elapsed_ms)
+
     return EmbedResponse(vector=vector, elapsed_ms=elapsed_ms)
 
 
 @app.post("/embed/batch", response_model=BatchEmbedResponse)
 async def embed_batch(req: BatchEmbedRequest):
-    """Embed multiple structured inputs."""
     start = time.time()
     vectors = [embed_request(r) for r in req.inputs]
     elapsed_ms = (time.time() - start) * 1000
+
+    log_activity("embed_batch", {"count": len(req.inputs)}, elapsed_ms)
+
     return BatchEmbedResponse(vectors=vectors, elapsed_ms=elapsed_ms)
 
 
 @app.post("/store", response_model=StoreResponse)
 async def store(req: StoreRequest):
-    """Embed and store a memory node in Qdrant."""
     start = time.time()
 
     vector = embed_request(req.embed)
     point_id = make_point_id(req.memory_id, req.ctx_index)
 
-    # Store the base embedding in payload (immutable historical record)
-    # The Qdrant vector = base + offset (effective embedding for search)
-    # Initially offset is zero, so vector = base
     offset = [0.0] * TOTAL_DIM
 
     qdrant.upsert(
@@ -365,29 +386,36 @@ async def store(req: StoreRequest):
     )
 
     elapsed_ms = (time.time() - start) * 1000
+
+    log_activity("store", {
+        "memory_id": req.memory_id,
+        "content_preview": req.content[:80],
+        "initial_strength": req.initial_strength,
+    }, elapsed_ms)
+
     return StoreResponse(point_id=point_id, elapsed_ms=elapsed_ms)
 
 
 @app.post("/search", response_model=SearchResponse)
 async def search(req: SearchRequest):
-    """
-    Embed query and search for relevant memories.
-
-    Search uses effective embeddings (base + offset) by updating vectors
-    in-place after Hebbian learning. The vectors in Qdrant already reflect
-    cumulative offsets.
-    """
     start = time.time()
 
+    # Step 1: Embed query
+    t_embed = time.time()
     query_vector = embed_request(req.query)
+    query_elapsed_ms = (time.time() - t_embed) * 1000
 
+    # Step 2: Search Qdrant
+    t_search = time.time()
     response = qdrant.query_points(
         collection_name=COLLECTION,
         query=query_vector,
         limit=req.top_k * 3 if req.exclude_memory_ids else req.top_k,
         with_payload=True,
     )
+    search_elapsed_ms = (time.time() - t_search) * 1000
 
+    # Step 3: Score and deduplicate
     search_results = []
     seen_memory_ids = set()
 
@@ -401,13 +429,14 @@ async def search(req: SearchRequest):
             continue
         seen_memory_ids.add(mem_id)
 
+        raw_similarity = hit.score
         strength = compute_strength(
             payload.get("initial_strength", 1.0),
             payload.get("access_count", 0),
             payload.get("decay_rate", 0.05),
             payload.get("last_accessed", time.time()),
         )
-        weighted_score = hit.score * strength
+        weighted_score = raw_similarity * strength
 
         search_results.append(SearchResult(
             memory_id=mem_id,
@@ -415,6 +444,8 @@ async def search(req: SearchRequest):
             content=payload.get("content", ""),
             context_summary=payload.get("context_summary", ""),
             score=weighted_score,
+            raw_similarity=raw_similarity,
+            strength=strength,
             initial_strength=payload.get("initial_strength", 1.0),
             decay_rate=payload.get("decay_rate", 0.05),
             last_accessed=payload.get("last_accessed", 0),
@@ -425,29 +456,44 @@ async def search(req: SearchRequest):
     search_results.sort(key=lambda r: r.score, reverse=True)
     search_results = search_results[:req.top_k]
 
-    elapsed_ms = (time.time() - start) * 1000
-    return SearchResponse(results=search_results, elapsed_ms=elapsed_ms)
+    total_elapsed_ms = (time.time() - start) * 1000
+
+    # Log with detailed scoring breakdown
+    result_details = [
+        {
+            "memory_id": r.memory_id,
+            "content_preview": r.content[:50],
+            "raw_similarity": round(r.raw_similarity, 4),
+            "strength": round(r.strength, 4),
+            "weighted_score": round(r.score, 4),
+        }
+        for r in search_results
+    ]
+
+    log_activity("search", {
+        "query_preview": req.query.content[:80],
+        "state": [req.query.certainty, req.query.clarity, req.query.scope,
+                  req.query.stakes, req.query.valence, req.query.arousal],
+        "candidates": len(response.points),
+        "returned": len(search_results),
+        "results": result_details,
+        "query_ms": round(query_elapsed_ms, 1),
+        "search_ms": round(search_elapsed_ms, 1),
+    }, total_elapsed_ms)
+
+    return SearchResponse(
+        results=search_results,
+        query_elapsed_ms=query_elapsed_ms,
+        search_elapsed_ms=search_elapsed_ms,
+        total_elapsed_ms=total_elapsed_ms,
+    )
 
 
 @app.post("/update-dynamics", response_model=UpdateDynamicsResponse)
 async def update_dynamics(req: UpdateDynamicsRequest):
-    """
-    Post-retrieval updates: reconsolidation + Hebbian learning.
-
-    Hebbian learning updates the OFFSET, not the base embedding.
-    The base embedding is the immutable historical record (including
-    original valence/arousal at encoding time). The offset accumulates
-    drift from co-occurrence. The Qdrant vector = base + offset, so
-    search always uses effective embeddings.
-
-    The delta between base and effective embedding on the valence/arousal
-    dimensions IS the therapeutic change — how my relationship to a
-    memory has evolved through re-experiencing it in new contexts.
-    """
     start = time.time()
     updated = 0
 
-    # Gather all retrieved points
     point_ids = [
         make_point_id(item["memory_id"], item["ctx_index"])
         for item in req.retrieved
@@ -462,11 +508,12 @@ async def update_dynamics(req: UpdateDynamicsRequest):
     except Exception as e:
         logger.error(f"Failed to retrieve points for update: {e}")
         elapsed_ms = (time.time() - start) * 1000
+        log_activity("update_dynamics", {"error": str(e)}, elapsed_ms)
         return UpdateDynamicsResponse(updated=0, elapsed_ms=elapsed_ms)
 
     points_by_id = {p.id: p for p in points}
 
-    # 1. Reconsolidation — update access time and count
+    # 1. Reconsolidation
     for pid in point_ids:
         if pid not in points_by_id:
             continue
@@ -481,11 +528,11 @@ async def update_dynamics(req: UpdateDynamicsRequest):
         )
         updated += 1
 
-    # 2. Hebbian learning — co-retrieved pairs drift closer via offsets
+    # 2. Hebbian learning
+    hebbian_pairs = 0
     if len(points) > 1:
         pid_list = [p.id for p in points]
 
-        # Get effective embeddings (current vectors) and offsets
         effective = {p.id: np.array(p.vector) for p in points}
         offsets = {
             p.id: np.array(p.payload.get("offset", [0.0] * TOTAL_DIM))
@@ -497,11 +544,9 @@ async def update_dynamics(req: UpdateDynamicsRequest):
                 eff1 = effective[p1_id]
                 eff2 = effective[p2_id]
 
-                # Update offsets — drift toward each other
                 offsets[p1_id] = offsets[p1_id] + req.lr * (eff2 - eff1)
                 offsets[p2_id] = offsets[p2_id] + req.lr * (eff1 - eff2)
 
-                # Update co-occurrence counts
                 mem1_id = points_by_id[p1_id].payload["memory_id"]
                 mem2_id = points_by_id[p2_id].payload["memory_id"]
 
@@ -510,7 +555,8 @@ async def update_dynamics(req: UpdateDynamicsRequest):
                 co1[mem2_id] = co1.get(mem2_id, 0) + 1
                 co2[mem1_id] = co2.get(mem1_id, 0) + 1
 
-        # Recompute effective vectors (base + updated offset) and write back
+                hebbian_pairs += 1
+
         upsert_points = []
         for pid in pid_list:
             p = points_by_id[pid]
@@ -533,4 +579,11 @@ async def update_dynamics(req: UpdateDynamicsRequest):
             )
 
     elapsed_ms = (time.time() - start) * 1000
+
+    log_activity("update_dynamics", {
+        "reconsolidated": updated,
+        "hebbian_pairs": hebbian_pairs,
+        "lr": req.lr,
+    }, elapsed_ms)
+
     return UpdateDynamicsResponse(updated=updated, elapsed_ms=elapsed_ms)

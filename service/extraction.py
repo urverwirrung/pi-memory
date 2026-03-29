@@ -5,14 +5,13 @@ Runs Qwen2.5-7B-Instruct on the 5080 for:
 - Memory extraction: identifies discrete memories from exchanges
 - Summarization: compresses context for various purposes
 - Utility generation: any lightweight generation task
-
-Complements the embedding service (GTE-Qwen2-7B on the 5070ti).
 """
 
 import os
 import time
 import json
 import logging
+from collections import deque
 from contextlib import asynccontextmanager
 
 import torch
@@ -27,11 +26,24 @@ logger = logging.getLogger("pi-extraction")
 model = None
 tokenizer = None
 
+MAX_ACTIVITY_LOG = 100
+activity_log = deque(maxlen=MAX_ACTIVITY_LOG)
+
+
+def log_activity(operation: str, details: dict, elapsed_ms: float):
+    entry = {
+        "timestamp": time.time(),
+        "operation": operation,
+        "elapsed_ms": round(elapsed_ms, 2),
+        **details,
+    }
+    activity_log.appendleft(entry)
+    logger.info(f"[{operation}] {elapsed_ms:.1f}ms — {details}")
+
 
 # --- Request/Response Models ---
 
 class ExtractRequest(BaseModel):
-    """Extract discrete memories from an exchange."""
     user_message: str
     assistant_response: str
     context: str = ""
@@ -41,16 +53,16 @@ class ExtractRequest(BaseModel):
 class ExtractedMemory(BaseModel):
     content: str
     context_summary: str
-    type: str = "episodic"  # episodic, decision, insight, pattern, preference
+    type: str = "episodic"
 
 
 class ExtractResponse(BaseModel):
     memories: list[ExtractedMemory]
+    raw_output: str           # raw model output for debugging
     elapsed_ms: float
 
 
 class SummarizeRequest(BaseModel):
-    """Summarize text for compression."""
     text: str
     instruction: str = "Summarize the key points concisely."
     max_tokens: int = 500
@@ -62,7 +74,6 @@ class SummarizeResponse(BaseModel):
 
 
 class GenerateRequest(BaseModel):
-    """General-purpose generation."""
     prompt: str
     system_prompt: str = ""
     max_tokens: int = 1000
@@ -115,7 +126,6 @@ def load_model():
 
 
 def generate(messages: list[dict], max_tokens: int = 500, temperature: float = 0.3) -> str:
-    """Generate text from a chat-formatted message list."""
     text = tokenizer.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
     )
@@ -132,7 +142,6 @@ def generate(messages: list[dict], max_tokens: int = 500, temperature: float = 0
             pad_token_id=tokenizer.eos_token_id,
         )
 
-    # Decode only the generated tokens (not the input)
     generated = outputs[0][inputs["input_ids"].shape[1]:]
     return tokenizer.decode(generated, skip_special_tokens=True)
 
@@ -163,6 +172,11 @@ async def health():
     }
 
 
+@app.get("/activity")
+async def get_activity(limit: int = 20):
+    return {"operations": list(activity_log)[:limit]}
+
+
 EXTRACTION_SYSTEM = """You extract discrete memories from conversation exchanges.
 
 Given a user message and assistant response, identify what is worth remembering.
@@ -189,7 +203,6 @@ Return ONLY the JSON array, no other text. If nothing is worth remembering, retu
 
 @app.post("/extract", response_model=ExtractResponse)
 async def extract(req: ExtractRequest):
-    """Extract discrete memories from an exchange."""
     start = time.time()
 
     context_line = f"\nConversation context: {req.context}" if req.context else ""
@@ -205,10 +218,8 @@ ASSISTANT: {req.assistant_response}"""},
 
     raw = generate(messages, max_tokens=1000, temperature=0.1)
 
-    # Parse JSON from response
     memories = []
     try:
-        # Handle potential markdown code blocks
         cleaned = raw.strip()
         if cleaned.startswith("```"):
             cleaned = cleaned.split("\n", 1)[1] if "\n" in cleaned else cleaned[3:]
@@ -230,12 +241,18 @@ ASSISTANT: {req.assistant_response}"""},
         logger.debug(f"Raw output: {raw}")
 
     elapsed_ms = (time.time() - start) * 1000
-    return ExtractResponse(memories=memories, elapsed_ms=elapsed_ms)
+
+    log_activity("extract", {
+        "user_preview": req.user_message[:80],
+        "memories_extracted": len(memories),
+        "memory_types": [m.type for m in memories],
+    }, elapsed_ms)
+
+    return ExtractResponse(memories=memories, raw_output=raw, elapsed_ms=elapsed_ms)
 
 
 @app.post("/summarize", response_model=SummarizeResponse)
 async def summarize(req: SummarizeRequest):
-    """Summarize text."""
     start = time.time()
 
     messages = [
@@ -246,12 +263,17 @@ async def summarize(req: SummarizeRequest):
     summary = generate(messages, max_tokens=req.max_tokens, temperature=0.2)
 
     elapsed_ms = (time.time() - start) * 1000
+
+    log_activity("summarize", {
+        "input_length": len(req.text),
+        "output_length": len(summary),
+    }, elapsed_ms)
+
     return SummarizeResponse(summary=summary.strip(), elapsed_ms=elapsed_ms)
 
 
 @app.post("/generate", response_model=GenerateResponse)
 async def gen(req: GenerateRequest):
-    """General-purpose generation."""
     start = time.time()
 
     messages = []
@@ -262,4 +284,10 @@ async def gen(req: GenerateRequest):
     text = generate(messages, max_tokens=req.max_tokens, temperature=req.temperature)
 
     elapsed_ms = (time.time() - start) * 1000
+
+    log_activity("generate", {
+        "prompt_preview": req.prompt[:80],
+        "output_length": len(text),
+    }, elapsed_ms)
+
     return GenerateResponse(text=text.strip(), elapsed_ms=elapsed_ms)
